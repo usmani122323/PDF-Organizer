@@ -54,7 +54,7 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
             status_color = colors.red
             note = f"WARNING: Missing {abs(difference)} label(s) - DO NOT SHIP until printed"
         
-        # Draw status box below header/barcode area (about 150px from top)
+        # Draw status box below header/barcode area
         note_height = 60
         box_y = height - 150 - note_height
         
@@ -81,11 +81,61 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
         print(f"❌ Error creating status overlay: {str(e)}")
         raise
 
+def create_unmatched_separator_page(unmatched_count, width=612, height=792):
+    """Create a warning page for labels without checklists"""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=(width, height))
+    
+    # Background
+    c.setFillColor(colors.HexColor('#FFF3CD'))
+    c.rect(0, 0, width, height, fill=True, stroke=False)
+    
+    # Warning banner
+    banner_height = 120
+    banner_y = (height - banner_height) / 2
+    
+    c.setFillColor(colors.HexColor('#FF9800'))
+    c.setStrokeColor(colors.HexColor('#F57C00'))
+    c.setLineWidth(3)
+    c.rect(50, banner_y, width - 100, banner_height, fill=True, stroke=True)
+    
+    # Warning icon and text
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 48)
+    c.drawCentredString(width / 2, banner_y + 70, "⚠️")
+    
+    c.setFont("Helvetica-Bold", 24)
+    c.drawCentredString(width / 2, banner_y + 45, "LABELS WITHOUT CHECKLIST")
+    
+    c.setFont("Helvetica", 16)
+    c.drawCentredString(width / 2, banner_y + 20, f"{unmatched_count} label(s) found with no matching checklist")
+    
+    # Instructions
+    c.setFillColor(colors.HexColor('#856404'))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawCentredString(width / 2, banner_y - 40, "ACTION REQUIRED:")
+    
+    c.setFont("Helvetica", 12)
+    instructions = [
+        "• Check if checklists are missing or delayed",
+        "• Verify SKUs match between checklist and labels",
+        "• Hold these shipments until checklists arrive",
+        "• Update daily order report if needed"
+    ]
+    
+    y_pos = banner_y - 70
+    for instruction in instructions:
+        c.drawString(100, y_pos, instruction)
+        y_pos -= 25
+    
+    c.save()
+    buffer.seek(0)
+    return buffer
+
 @app.route('/')
 def home():
     """Serve the main HTML page"""
     try:
-        # Get the directory where app.py is located
         base_dir = os.path.dirname(os.path.abspath(__file__))
         index_path = os.path.join(base_dir, 'index.html')
         
@@ -117,7 +167,6 @@ def organize_pdfs():
         print("📋 NEW REQUEST RECEIVED")
         print("="*50)
         
-        # Get uploaded files
         checklist_file = request.files.get('checklist')
         labels_file = request.files.get('labels')
         csv_data = request.form.get('csv_data', '')
@@ -135,7 +184,7 @@ def organize_pdfs():
         print(f"📋 Checklist: {checklist_file.filename}")
         print(f"🏷️  Labels: {labels_file.filename}")
         
-        # Parse CSV mapping if provided
+        # Parse CSV mapping
         sku_mapping = {}
         if csv_data:
             print(f"📊 CSV mapping provided")
@@ -165,7 +214,6 @@ def organize_pdfs():
                     print(f"\n   Page {i+1}:")
                     print(f"   - Extracted {len(text)} characters")
                     
-                    # Extract SKUs
                     skus = extract_skus_from_text(text)
                     print(f"   - Found SKUs: {skus}")
                     
@@ -173,7 +221,6 @@ def organize_pdfs():
                         print(f"   ⚠️  No SKUs found on page {i+1}")
                         continue
                     
-                    # Extract expected quantities
                     sku_quantities = {}
                     for sku in skus:
                         qty_pattern = rf'{re.escape(sku)}\s+(\d+)'
@@ -200,7 +247,7 @@ def organize_pdfs():
             return jsonify({"error": error_msg}), 500
         
         if not checklists:
-            error_msg = "No SKUs found in checklist PDF. Make sure your checklist contains SKUs like 'N5-96TU-TT9Z' or 'B0090IFLG6'"
+            error_msg = "No SKUs found in checklist PDF"
             print(f"❌ ERROR: {error_msg}")
             return jsonify({"error": error_msg}), 400
         
@@ -223,7 +270,6 @@ def organize_pdfs():
                 for i, (pypdf_page, plumber_page) in enumerate(zip(labels_reader.pages, pdf.pages)):
                     text = plumber_page.extract_text()
                     
-                    # Extract SKU
                     skus = extract_skus_from_text(text)
                     sku = skus[0] if skus else None
                     
@@ -254,7 +300,10 @@ def organize_pdfs():
         
         print(f"   Labels grouped by {len(labels_by_sku)} unique SKUs")
         
+        # Track which labels were matched
+        matched_label_pages = set()
         matched_groups = []
+        
         for checklist in checklists:
             matching_labels = []
             
@@ -263,14 +312,18 @@ def organize_pdfs():
                 if sku in labels_by_sku:
                     count = len(labels_by_sku[sku])
                     print(f"   ✓ {sku}: Found {count} matching label(s)")
-                    matching_labels.extend(labels_by_sku[sku])
+                    for label in labels_by_sku[sku]:
+                        matching_labels.append(label)
+                        matched_label_pages.add(label['page_num'])
                 # Check CSV mapping
                 elif sku_mapping and sku in sku_mapping:
                     mapped_sku = sku_mapping[sku]
                     if mapped_sku in labels_by_sku:
                         count = len(labels_by_sku[mapped_sku])
                         print(f"   ✓ {sku} → {mapped_sku}: Found {count} matching label(s) via mapping")
-                        matching_labels.extend(labels_by_sku[mapped_sku])
+                        for label in labels_by_sku[mapped_sku]:
+                            matching_labels.append(label)
+                            matched_label_pages.add(label['page_num'])
                     else:
                         print(f"   ✗ {sku} → {mapped_sku}: No matching labels found")
                 else:
@@ -278,49 +331,59 @@ def organize_pdfs():
             
             matched_groups.append((checklist, matching_labels))
         
-        print(f"\n✓ Matched {len(matched_groups)} order(s)")
+        # Find unmatched labels
+        unmatched_labels = [label for label in labels if label['page_num'] not in matched_label_pages]
         
-        # Create organized PDF with status banners
+        print(f"\n✓ Matched {len(matched_groups)} order(s)")
+        print(f"⚠️  Found {len(unmatched_labels)} unmatched label(s)")
+        
+        # Create organized PDF
         print("\n🔍 STEP 4: Creating organized PDF...")
         try:
             output = io.BytesIO()
             writer = PdfWriter()
             
+            # Add matched groups first
             for checklist, matching_labels in matched_groups:
-                # Calculate total expected and actual
                 total_expected = sum(checklist['sku_quantities'].values())
                 total_actual = len(matching_labels)
                 
                 print(f"   Checklist page {checklist['page_num']}: Expected {total_expected}, Found {total_actual}")
                 
-                # Get page dimensions
                 checklist_page = checklist['page']
                 mediabox = checklist_page.mediabox
                 width = float(mediabox.width)
                 height = float(mediabox.height)
                 
-                # Create status overlay
                 overlay_buffer = create_status_overlay(total_expected, total_actual, width, height)
                 overlay_reader = PdfReader(overlay_buffer)
                 
-                # Merge overlay with checklist
                 checklist_page.merge_page(overlay_reader.pages[0])
-                
-                # Add checklist with overlay
                 writer.add_page(checklist_page)
                 
-                # Add all matching labels
                 for label in matching_labels:
                     writer.add_page(label['page'])
             
-            # Write to output
+            # Add unmatched labels section if any exist
+            if unmatched_labels:
+                print(f"\n   Adding separator page for {len(unmatched_labels)} unmatched labels...")
+                separator_buffer = create_unmatched_separator_page(len(unmatched_labels))
+                separator_reader = PdfReader(separator_buffer)
+                writer.add_page(separator_reader.pages[0])
+                
+                print(f"   Adding {len(unmatched_labels)} unmatched labels...")
+                for label in unmatched_labels:
+                    writer.add_page(label['page'])
+                    print(f"   - Added label page {label['page_num']} (SKU: {label['sku'] or 'None'})")
+            
             writer.write(output)
             output.seek(0)
             
             total_pages = len(writer.pages)
             print(f"\n✓ Created organized PDF with {total_pages} pages")
+            print(f"  - Matched sections: {len(matched_groups)}")
+            print(f"  - Unmatched labels: {len(unmatched_labels)}")
             
-            # Save to temp file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
             temp_file.write(output.read())
             temp_file.close()
@@ -330,7 +393,6 @@ def organize_pdfs():
             print("🎉 SUCCESS!")
             print("="*50 + "\n")
             
-            # Send file
             return send_file(
                 temp_file.name,
                 mimetype='application/pdf',
