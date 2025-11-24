@@ -81,6 +81,214 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
         print(f"❌ Error creating status overlay: {str(e)}")
         raise
 
+def create_summary_page(matched_groups, unmatched_labels, total_labels, start_time, width=612, height=792):
+    """Create a comprehensive summary page"""
+    import time
+    processing_time = time.time() - start_time
+    
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=(width, height))
+    
+    # Background
+    c.setFillColor(colors.white)
+    c.rect(0, 0, width, height, fill=True, stroke=False)
+    
+    # Header section
+    c.setFillColor(colors.HexColor('#667eea'))
+    c.rect(0, height - 120, width, 120, fill=True, stroke=False)
+    
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 28)
+    c.drawCentredString(width / 2, height - 50, "📦 USMANI WHOLESALE")
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(width / 2, height - 75, "DAILY SHIPPING SUMMARY REPORT")
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(width / 2, height - 95, datetime.now().strftime("%B %d, %Y - %I:%M %p"))
+    
+    y = height - 150
+    
+    # Processing Summary Box
+    c.setFillColor(colors.HexColor('#F0F4FF'))
+    c.setStrokeColor(colors.HexColor('#667eea'))
+    c.setLineWidth(2)
+    c.rect(40, y - 80, width - 80, 75, fill=True, stroke=True)
+    
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(60, y - 25, "📊 PROCESSING SUMMARY")
+    c.setFont("Helvetica", 11)
+    c.drawString(80, y - 45, f"• Total Checklists: {len(matched_groups)}")
+    c.drawString(80, y - 60, f"• Total Labels: {total_labels}")
+    c.drawString(80, y - 75, f"• Processing Time: {processing_time:.1f} seconds")
+    
+    y -= 110
+    
+    # Matched Orders Section
+    c.setFillColor(colors.HexColor('#28a745'))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, f"✅ MATCHED ORDERS: {len(matched_groups)}")
+    
+    y -= 25
+    c.setFont("Helvetica", 10)
+    
+    page_num = 2  # Summary is page 1, content starts at page 2
+    
+    for i, (checklist, labels) in enumerate(matched_groups, 1):
+        if y < 200:  # If running out of space
+            break
+            
+        expected = sum(checklist['sku_quantities'].values())
+        actual = len(labels)
+        diff = actual - expected
+        
+        # Extract PO number from checklist text
+        po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
+        po_num = po_match.group(1) if po_match else "Unknown"
+        
+        # Extract supplier
+        supplier_match = re.search(r'Supplier:\s*([^\n]+)', checklist['text'])
+        supplier = supplier_match.group(1).strip() if supplier_match else "Unknown"
+        
+        # Status color and text
+        if diff == 0:
+            status_color = colors.HexColor('#28a745')
+            status_text = f"✓ {actual}/{expected} Labels - Perfect Match"
+        elif diff > 0:
+            status_color = colors.HexColor('#FF9800')
+            status_text = f"⚠ {actual}/{expected} Labels - {diff} EXTRA"
+        else:
+            status_color = colors.HexColor('#dc3545')
+            status_text = f"✗ {actual}/{expected} Labels - {abs(diff)} MISSING"
+        
+        # Draw order info
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(60, y, f"{i}. PO-{po_num} ({supplier})")
+        
+        c.setFont("Helvetica", 9)
+        c.setFillColor(colors.HexColor('#666666'))
+        skus = ", ".join(checklist['skus'][:2])  # Show first 2 SKUs
+        if len(checklist['skus']) > 2:
+            skus += f" +{len(checklist['skus']) - 2} more"
+        c.drawString(75, y - 12, f"SKU: {skus}")
+        
+        c.setFillColor(status_color)
+        c.drawString(75, y - 24, f"Status: {status_text}")
+        
+        c.setFillColor(colors.HexColor('#666666'))
+        end_page = page_num + len(labels)
+        c.drawString(75, y - 36, f"Pages: {page_num}-{end_page}")
+        
+        page_num = end_page + 1
+        y -= 50
+    
+    if len(matched_groups) > 4:
+        c.setFont("Helvetica-Italic", 9)
+        c.setFillColor(colors.HexColor('#666666'))
+        c.drawString(60, y, f"... and {len(matched_groups) - 4} more orders (see full PDF)")
+        y -= 20
+    
+    y -= 20
+    
+    # Unmatched Labels Section
+    if unmatched_labels:
+        c.setFillColor(colors.HexColor('#FF9800'))
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, y, f"⚠️ UNMATCHED LABELS: {len(unmatched_labels)}")
+        y -= 20
+        
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        for label in unmatched_labels[:3]:
+            order_match = re.search(r'Order.*?(\d{3}-\d{7}-\d{7})', label.get('text', ''))
+            order_num = order_match.group(1) if order_match else "Unknown"
+            c.drawString(60, y, f"• SKU: {label['sku'] or 'None'} (Order #{order_num})")
+            y -= 15
+        
+        if len(unmatched_labels) > 3:
+            c.setFont("Helvetica-Italic", 9)
+            c.setFillColor(colors.HexColor('#666666'))
+            c.drawString(60, y, f"... and {len(unmatched_labels) - 3} more (see end of PDF)")
+            y -= 15
+        
+        y -= 10
+    
+    # Action Items Section
+    y -= 20
+    c.setFillColor(colors.HexColor('#667eea'))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, "🎯 ACTION ITEMS")
+    y -= 25
+    
+    # High priority items (missing labels)
+    missing_orders = [(checklist, labels) for checklist, labels in matched_groups 
+                      if len(labels) < sum(checklist['sku_quantities'].values())]
+    
+    if missing_orders:
+        c.setFillColor(colors.HexColor('#dc3545'))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(60, y, "⚠️ HIGH PRIORITY:")
+        y -= 15
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        for checklist, labels in missing_orders[:2]:
+            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
+            po_num = po_match.group(1) if po_match else "Unknown"
+            missing = sum(checklist['sku_quantities'].values()) - len(labels)
+            c.drawString(75, y, f"• PO-{po_num}: MISSING {missing} label(s) - DO NOT SHIP")
+            y -= 15
+        y -= 10
+    
+    # Review needed items (extras or unmatched)
+    extra_orders = [(checklist, labels) for checklist, labels in matched_groups 
+                    if len(labels) > sum(checklist['sku_quantities'].values())]
+    
+    if extra_orders or unmatched_labels:
+        c.setFillColor(colors.HexColor('#FF9800'))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(60, y, "📋 REVIEW NEEDED:")
+        y -= 15
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        
+        for checklist, labels in extra_orders[:2]:
+            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
+            po_num = po_match.group(1) if po_match else "Unknown"
+            c.drawString(75, y, f"• PO-{po_num}: Verify extra labels before shipping")
+            y -= 15
+        
+        if unmatched_labels:
+            c.drawString(75, y, f"• {len(unmatched_labels)} unmatched labels need checklist assignment")
+            y -= 15
+        y -= 10
+    
+    # Ready to ship
+    perfect_orders = [(checklist, labels) for checklist, labels in matched_groups 
+                      if len(labels) == sum(checklist['sku_quantities'].values())]
+    
+    if perfect_orders:
+        c.setFillColor(colors.HexColor('#28a745'))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(60, y, f"✅ READY TO SHIP: {len(perfect_orders)} order(s)")
+        y -= 15
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        for checklist, labels in perfect_orders[:3]:
+            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
+            po_num = po_match.group(1) if po_match else "Unknown"
+            c.drawString(75, y, f"• PO-{po_num} (Perfect match)")
+            y -= 15
+    
+    # Footer
+    c.setFillColor(colors.HexColor('#999999'))
+    c.setFont("Helvetica-Italic", 9)
+    c.drawCentredString(width / 2, 30, "Generated by PDF Organizer v2.0")
+    c.drawCentredString(width / 2, 18, "https://pdf-organizer-evoe.onrender.com")
+    
+    c.save()
+    buffer.seek(0)
+    return buffer
+
 def create_unmatched_separator_page(unmatched_count, width=612, height=792):
     """Create a warning page for labels without checklists"""
     buffer = io.BytesIO()
@@ -340,8 +548,25 @@ def organize_pdfs():
         # Create organized PDF
         print("\n🔍 STEP 4: Creating organized PDF...")
         try:
+            import time
+            start_time = time.time()
+            
             output = io.BytesIO()
             writer = PdfWriter()
+            
+            # Add summary page FIRST
+            print("   Creating summary page...")
+            # Store label text for summary page
+            for label in labels:
+                if 'text' not in label:
+                    with pdfplumber.open(labels_file) as pdf:
+                        page_idx = label['page_num'] - 1
+                        label['text'] = pdf.pages[page_idx].extract_text()
+            
+            summary_buffer = create_summary_page(matched_groups, unmatched_labels, len(labels), start_time)
+            summary_reader = PdfReader(summary_buffer)
+            writer.add_page(summary_reader.pages[0])
+            print("   ✓ Summary page added")
             
             # Add matched groups first
             for checklist, matching_labels in matched_groups:
