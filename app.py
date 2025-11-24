@@ -1,268 +1,238 @@
-"""
-Usmani Wholesale - PDF Organizer API
-Flask backend for processing shipping labels and checklists
-"""
-
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+import pdfplumber
+import io
 import os
 import re
-import io
 from datetime import datetime
-from pypdf import PdfReader, PdfWriter
-import pdfplumber
-import pandas as pd
-from werkzeug.utils import secure_filename
+import tempfile
+from collections import defaultdict
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend access
+CORS(app)
 
-# Configuration
-UPLOAD_FOLDER = 'uploads'
-OUTPUT_FOLDER = 'outputs'
-ALLOWED_EXTENSIONS = {'pdf', 'csv'}
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
-
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def extract_po_number(text):
-    """Extract PO Number from checklist"""
-    patterns = [
-        r'PO\s*Number[:\s]*(\d+)',
-        r'PO[:\s]*(\d{15})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
-
-
-def extract_order_number(text):
-    """Extract Order # from shipping label"""
-    patterns = [
-        r'Order\s*#[:\s]*(\d{3}-\d{7}-\d{7})',
-        r'(\d{3}-\d{7}-\d{7})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
-    return None
-
-
-def extract_sku_from_checklist(text):
-    """Extract SKUs from checklist"""
-    patterns = [
-        r'\b(B[A-Z0-9]{9,10})\b',
-    ]
+def extract_skus_from_text(text):
+    """Extract SKUs from text using multiple patterns"""
     skus = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        skus.extend(matches)
+    
+    # Pattern 1: N5-96TU-TT9Z style
+    pattern1 = re.findall(r'\b[A-Z]\d-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
+    skus.extend(pattern1)
+    
+    # Pattern 2: B0090IFLG6 style (Amazon ASIN)
+    pattern2 = re.findall(r'\bB[A-Z0-9]{9,10}\b', text)
+    skus.extend(pattern2)
+    
+    # Remove duplicates
     return list(set(skus))
 
-
-def extract_sku_from_label(text):
-    """Extract SKU from shipping label"""
-    patterns = [
-        r'SKU[:\s]*([A-Z0-9-]{10,15})',
-        r'\b([A-Z]\d-[A-Z0-9]{4}-[A-Z0-9]{4})\b',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1)
-    return None
-
-
-def process_pdf(pdf_path, is_checklist=True):
-    """Process PDF and extract information"""
-    pages_info = []
-    reader = PdfReader(pdf_path)
+def create_status_overlay(expected_qty, actual_qty, width, height):
+    """Create a status banner overlay for checklist"""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=(width, height))
     
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, (pypdf_page, plumber_page) in enumerate(zip(reader.pages, pdf.pages)):
-            text = plumber_page.extract_text()
-            
-            if is_checklist:
-                po_num = extract_po_number(text)
-                skus = extract_sku_from_checklist(text)
-                pages_info.append({
-                    'page': pypdf_page,
-                    'po_number': po_num,
-                    'skus': skus,
-                    'index': i,
-                    'type': 'checklist'
-                })
-            else:
-                order_num = extract_order_number(text)
-                sku = extract_sku_from_label(text)
-                pages_info.append({
-                    'page': pypdf_page,
-                    'order_number': order_num,
-                    'sku': sku,
-                    'index': i,
-                    'type': 'label'
-                })
+    # Calculate difference
+    difference = actual_qty - expected_qty
     
-    return pages_info
-
-
-def match_by_sku(checklists, labels, csv_data=None):
-    """Match labels to checklists using SKU only"""
-    matched_groups = []
+    # Determine status and color
+    if difference == 0:
+        status_text = f"✓ {actual_qty}/{expected_qty} Labels - Perfect Match"
+        status_color = colors.green
+        note = ""
+    elif difference > 0:
+        status_text = f"⚠ {actual_qty}/{expected_qty} Labels - {difference} EXTRA"
+        status_color = colors.orange
+        note = f"Note: {difference} extra label(s) included - verify before shipping"
+    else:
+        status_text = f"✗ {actual_qty}/{expected_qty} Labels - {abs(difference)} MISSING"
+        status_color = colors.red
+        note = f"WARNING: Missing {abs(difference)} label(s) - DO NOT SHIP until printed"
     
-    # Parse CSV data if provided - now just for SKU info
-    sku_mapping = {}
-    if csv_data:
-        try:
-            df = pd.read_csv(io.StringIO(csv_data))
-            df.columns = df.columns.str.lower().str.strip()
-            
-            # Build mapping of checklist SKU to label SKU
-            for _, row in df.iterrows():
-                checklist_sku = str(row.get('checklist_sku', '') or row.get('sku', '')).strip()
-                label_sku = str(row.get('label_sku', '') or row.get('sku', '')).strip()
-                if checklist_sku and label_sku:
-                    sku_mapping[checklist_sku] = label_sku
-        except Exception as e:
-            print(f"Error parsing CSV: {e}")
+    # Draw status box at top
+    note_height = 60
+    box_y = height - note_height
     
-    for checklist in checklists:
-        checklist_skus = checklist.get('skus', [])
-        
-        # Find matching labels by SKU
-        matching_labels = []
-        
-        for label in labels:
-            label_sku = label.get('sku', '')
-            
-            # Try direct matching first
-            if any(label_sku in sku or sku in label_sku for sku in checklist_skus):
-                matching_labels.append(label)
-            # If CSV mapping exists, try that too
-            elif sku_mapping:
-                for checklist_sku in checklist_skus:
-                    if checklist_sku in sku_mapping:
-                        mapped_sku = sku_mapping[checklist_sku]
-                        if label_sku in mapped_sku or mapped_sku in label_sku:
-                            matching_labels.append(label)
-                            break
-        
-        matched_groups.append((checklist, matching_labels))
+    c.setFillColor(status_color)
+    c.setStrokeColor(status_color)
+    c.rect(0, box_y, width, note_height, fill=True, stroke=True)
     
-    return matched_groups
-
-
-def create_organized_pdf(matched_groups, output_path):
-    """Create organized PDF"""
-    writer = PdfWriter()
+    # Add text
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, box_y + 35, "SHIPPING LABELS STATUS:")
     
-    for checklist, labels in matched_groups:
-        writer.add_page(checklist['page'])
-        for label in labels:
-            writer.add_page(label['page'])
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, box_y + 15, status_text)
     
-    with open(output_path, 'wb') as f:
-        writer.write(f)
+    if note:
+        c.setFont("Helvetica", 10)
+        c.drawString(40, box_y + 3, note)
     
-    return len(writer.pages)
+    c.save()
+    buffer.seek(0)
+    return buffer
 
-
-@app.route('/')
-def index():
-    """Serve the main page"""
-    return send_file('index.html')
-
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy"}), 200
 
 @app.route('/api/organize-pdfs', methods=['POST'])
 def organize_pdfs():
-    """Main API endpoint to process PDFs"""
     try:
-        # Check files
-        if 'checklist' not in request.files or 'labels' not in request.files:
-            return jsonify({'error': 'Missing required files'}), 400
-        
-        checklist_file = request.files['checklist']
-        labels_file = request.files['labels']
-        
-        if checklist_file.filename == '' or labels_file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
-        
-        # Save uploaded files
-        checklist_path = os.path.join(
-            app.config['UPLOAD_FOLDER'],
-            secure_filename(f"checklist_{datetime.now().timestamp()}.pdf")
-        )
-        labels_path = os.path.join(
-            app.config['UPLOAD_FOLDER'],
-            secure_filename(f"labels_{datetime.now().timestamp()}.pdf")
-        )
-        
-        checklist_file.save(checklist_path)
-        labels_file.save(labels_path)
-        
-        # Get CSV data if provided
+        # Get uploaded files
+        checklist_file = request.files.get('checklist')
+        labels_file = request.files.get('labels')
         csv_data = request.form.get('csv_data', '')
         
-        # Process PDFs
-        checklists = process_pdf(checklist_path, is_checklist=True)
-        labels = process_pdf(labels_path, is_checklist=False)
+        if not checklist_file or not labels_file:
+            return jsonify({"error": "Missing required files"}), 400
         
-        # Match
-        matched_groups = match_by_sku(checklists, labels, csv_data if csv_data else None)
+        print(f"📋 Processing checklist: {checklist_file.filename}")
+        print(f"🏷️  Processing labels: {labels_file.filename}")
         
-        # Create output
-        output_filename = f"organized_{datetime.now().timestamp()}.pdf"
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-        total_pages = create_organized_pdf(matched_groups, output_path)
+        # Parse CSV mapping if provided
+        sku_mapping = {}
+        if csv_data:
+            for line in csv_data.strip().split('\n'):
+                if ',' in line:
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        sku_mapping[parts[0].strip()] = parts[1].strip()
         
-        # Clean up uploaded files
-        os.remove(checklist_path)
-        os.remove(labels_path)
+        # Process checklist PDF
+        checklist_reader = PdfReader(checklist_file)
+        checklists = []
         
-        return jsonify({
-            'success': True,
-            'checklists': len(checklists),
-            'labels': len(labels),
-            'matched': len(matched_groups),
-            'total_pages': total_pages,
-            'download_url': f'/api/download/{output_filename}'
-        })
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/download/<filename>')
-def download_file(filename):
-    """Download processed PDF"""
-    try:
-        file_path = os.path.join(app.config['OUTPUT_FOLDER'], secure_filename(filename))
+        with pdfplumber.open(checklist_file) as pdf:
+            for i, (pypdf_page, plumber_page) in enumerate(zip(checklist_reader.pages, pdf.pages)):
+                text = plumber_page.extract_text()
+                
+                # Extract SKUs
+                skus = extract_skus_from_text(text)
+                
+                # Extract expected quantities
+                sku_quantities = {}
+                for sku in skus:
+                    qty_pattern = rf'{re.escape(sku)}\s+(\d+)'
+                    qty_match = re.search(qty_pattern, text)
+                    if qty_match:
+                        sku_quantities[sku] = int(qty_match.group(1))
+                    else:
+                        sku_quantities[sku] = 0
+                
+                if skus:
+                    checklists.append({
+                        'page': pypdf_page,
+                        'page_num': i + 1,
+                        'skus': skus,
+                        'sku_quantities': sku_quantities,
+                        'text': text
+                    })
+        
+        print(f"✓ Found {len(checklists)} checklist(s)")
+        
+        # Process labels PDF
+        labels_reader = PdfReader(labels_file)
+        labels = []
+        
+        with pdfplumber.open(labels_file) as pdf:
+            for i, (pypdf_page, plumber_page) in enumerate(zip(labels_reader.pages, pdf.pages)):
+                text = plumber_page.extract_text()
+                
+                # Extract SKU
+                skus = extract_skus_from_text(text)
+                sku = skus[0] if skus else None
+                
+                labels.append({
+                    'page': pypdf_page,
+                    'page_num': i + 1,
+                    'sku': sku
+                })
+        
+        print(f"✓ Found {len(labels)} label(s)")
+        
+        # Match labels to checklists
+        labels_by_sku = defaultdict(list)
+        for label in labels:
+            if label['sku']:
+                labels_by_sku[label['sku']].append(label)
+        
+        matched_groups = []
+        for checklist in checklists:
+            matching_labels = []
+            
+            for sku in checklist['skus']:
+                # Direct match
+                if sku in labels_by_sku:
+                    matching_labels.extend(labels_by_sku[sku])
+                # Check CSV mapping
+                elif sku_mapping and sku in sku_mapping:
+                    mapped_sku = sku_mapping[sku]
+                    if mapped_sku in labels_by_sku:
+                        matching_labels.extend(labels_by_sku[mapped_sku])
+            
+            matched_groups.append((checklist, matching_labels))
+        
+        print(f"✓ Matched {len(matched_groups)} order(s)")
+        
+        # Create organized PDF with status banners
+        output = io.BytesIO()
+        writer = PdfWriter()
+        
+        for checklist, matching_labels in matched_groups:
+            # Calculate total expected and actual
+            total_expected = sum(checklist['sku_quantities'].values())
+            total_actual = len(matching_labels)
+            
+            # Get page dimensions
+            checklist_page = checklist['page']
+            mediabox = checklist_page.mediabox
+            width = float(mediabox.width)
+            height = float(mediabox.height)
+            
+            # Create status overlay
+            overlay_buffer = create_status_overlay(total_expected, total_actual, width, height)
+            overlay_reader = PdfReader(overlay_buffer)
+            
+            # Merge overlay with checklist
+            checklist_page.merge_page(overlay_reader.pages[0])
+            
+            # Add checklist with overlay
+            writer.add_page(checklist_page)
+            
+            # Add all matching labels
+            for label in matching_labels:
+                writer.add_page(label['page'])
+        
+        # Write to output
+        writer.write(output)
+        output.seek(0)
+        
+        print(f"✓ Created organized PDF with {len(writer.pages)} pages")
+        
+        # Save to temp file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        temp_file.write(output.read())
+        temp_file.close()
+        
+        # Send file
         return send_file(
-            file_path,
+            temp_file.name,
+            mimetype='application/pdf',
             as_attachment=True,
             download_name=f'organized_shipping_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
         )
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 404
-
-
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'healthy'})
-
+        print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
