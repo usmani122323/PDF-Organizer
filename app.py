@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
@@ -12,7 +12,7 @@ from datetime import datetime
 import tempfile
 from collections import defaultdict
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='.')
 CORS(app)
 
 def extract_skus_from_text(text):
@@ -75,6 +75,11 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
     c.save()
     buffer.seek(0)
     return buffer
+
+@app.route('/')
+def home():
+    """Serve the main HTML page"""
+    return send_file('index.html')
 
 @app.route('/health', methods=['GET'])
 def health():
