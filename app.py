@@ -20,16 +20,28 @@ def extract_skus_from_text(text):
     """Extract SKUs from text using multiple patterns"""
     skus = []
     
-    # Pattern 1: N5-96TU-TT9Z style
-    pattern1 = re.findall(r'\b[A-Z]\d-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
+    # Pattern 1: N5-96TU-TT9Z style (Letter+Digit or 2 Letters/Digits - 4 chars - 4 chars)
+    # Matches: N5-96TU-TT9Z, U2-5YVZ-Q8TC, S4-6D0J-DNSB, L4-KTDG-ZIY6, etc.
+    pattern1 = re.findall(r'\b[A-Z0-9]{2}-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
     skus.extend(pattern1)
     
     # Pattern 2: B0090IFLG6 style (Amazon ASIN)
     pattern2 = re.findall(r'\bB[A-Z0-9]{9,10}\b', text)
     skus.extend(pattern2)
     
-    # Remove duplicates
-    return list(set(skus))
+    # Pattern 3: Longer format like N7-KJ7T-EVIN (catches variations)
+    pattern3 = re.findall(r'\b[A-Z][0-9]-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
+    skus.extend(pattern3)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_skus = []
+    for sku in skus:
+        if sku not in seen:
+            seen.add(sku)
+            unique_skus.append(sku)
+    
+    return unique_skus
 
 def create_status_overlay(expected_qty, actual_qty, width, height):
     """Create a status banner overlay for checklist"""
