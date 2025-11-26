@@ -521,12 +521,14 @@ def organize_pdfs():
         
         print(f"   Labels grouped by {len(labels_by_sku)} unique SKUs")
         
-        # Track which labels were matched
+        # Track which labels were matched GLOBALLY (for unmatched detection)
         matched_label_pages = set()
         matched_groups = []
         
         for checklist in checklists:
             matching_labels = []
+            # Track which labels we've already added to THIS checklist
+            added_to_this_checklist = set()
             
             for sku in checklist['skus']:
                 # Direct match
@@ -534,8 +536,11 @@ def organize_pdfs():
                     count = len(labels_by_sku[sku])
                     print(f"   ✓ {sku}: Found {count} matching label(s)")
                     for label in labels_by_sku[sku]:
-                        matching_labels.append(label)
-                        matched_label_pages.add(label['page_num'])
+                        # Only add if not already added to this checklist
+                        if label['page_num'] not in added_to_this_checklist:
+                            matching_labels.append(label)
+                            matched_label_pages.add(label['page_num'])
+                            added_to_this_checklist.add(label['page_num'])
                 # Check CSV mapping
                 elif sku_mapping and sku in sku_mapping:
                     mapped_sku = sku_mapping[sku]
@@ -543,8 +548,11 @@ def organize_pdfs():
                         count = len(labels_by_sku[mapped_sku])
                         print(f"   ✓ {sku} → {mapped_sku}: Found {count} matching label(s) via mapping")
                         for label in labels_by_sku[mapped_sku]:
-                            matching_labels.append(label)
-                            matched_label_pages.add(label['page_num'])
+                            # Only add if not already added to this checklist
+                            if label['page_num'] not in added_to_this_checklist:
+                                matching_labels.append(label)
+                                matched_label_pages.add(label['page_num'])
+                                added_to_this_checklist.add(label['page_num'])
                     else:
                         print(f"   ✗ {sku} → {mapped_sku}: No matching labels found")
                 else:
