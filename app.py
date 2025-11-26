@@ -489,7 +489,8 @@ def organize_pdfs():
                     labels.append({
                         'page': pypdf_page,
                         'page_num': i + 1,
-                        'sku': sku
+                        'sku': sku,
+                        'text': text  # Store text here for summary page
                     })
         except Exception as e:
             error_msg = f"Error extracting text from labels: {str(e)}"
@@ -556,13 +557,6 @@ def organize_pdfs():
             
             # Add summary page FIRST
             print("   Creating summary page...")
-            # Store label text for summary page
-            for label in labels:
-                if 'text' not in label:
-                    with pdfplumber.open(labels_file) as pdf:
-                        page_idx = label['page_num'] - 1
-                        label['text'] = pdf.pages[page_idx].extract_text()
-            
             summary_buffer = create_summary_page(matched_groups, unmatched_labels, len(labels), start_time)
             summary_reader = PdfReader(summary_buffer)
             writer.add_page(summary_reader.pages[0])
