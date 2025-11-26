@@ -150,7 +150,8 @@ def create_summary_page(matched_groups, unmatched_labels, total_labels, start_ti
             break
             
         expected = sum(checklist['sku_quantities'].values())
-        actual = len(labels)
+        # Sum quantities instead of counting pages
+        actual = sum(label.get('qty', 1) for label in labels)
         diff = actual - expected
         
         # Extract PO number from checklist text
@@ -234,7 +235,7 @@ def create_summary_page(matched_groups, unmatched_labels, total_labels, start_ti
     
     # High priority items (missing labels)
     missing_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                      if len(labels) < sum(checklist['sku_quantities'].values())]
+                      if sum(label.get('qty', 1) for label in labels) < sum(checklist['sku_quantities'].values())]
     
     if missing_orders:
         c.setFillColor(colors.HexColor('#dc3545'))
@@ -246,14 +247,16 @@ def create_summary_page(matched_groups, unmatched_labels, total_labels, start_ti
         for checklist, labels in missing_orders[:2]:
             po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
             po_num = po_match.group(1) if po_match else "Unknown"
-            missing = sum(checklist['sku_quantities'].values()) - len(labels)
+            actual_qty = sum(label.get('qty', 1) for label in labels)
+            expected_qty = sum(checklist['sku_quantities'].values())
+            missing = expected_qty - actual_qty
             c.drawString(75, y, f"• PO-{po_num}: MISSING {missing} label(s) - DO NOT SHIP")
             y -= 15
         y -= 10
     
     # Review needed items (extras or unmatched)
     extra_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                    if len(labels) > sum(checklist['sku_quantities'].values())]
+                    if sum(label.get('qty', 1) for label in labels) > sum(checklist['sku_quantities'].values())]
     
     if extra_orders or unmatched_labels:
         c.setFillColor(colors.HexColor('#FF9800'))
@@ -276,7 +279,7 @@ def create_summary_page(matched_groups, unmatched_labels, total_labels, start_ti
     
     # Ready to ship
     perfect_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                      if len(labels) == sum(checklist['sku_quantities'].values())]
+                      if sum(label.get('qty', 1) for label in labels) == sum(checklist['sku_quantities'].values())]
     
     if perfect_orders:
         c.setFillColor(colors.HexColor('#28a745'))
@@ -493,15 +496,21 @@ def organize_pdfs():
                     skus = extract_skus_from_text(text)
                     sku = skus[0] if skus else None
                     
+                    # Extract quantity from label
+                    qty_pattern = r'Qty[:\s]+(\d+)'
+                    qty_match = re.search(qty_pattern, text, re.IGNORECASE)
+                    qty = int(qty_match.group(1)) if qty_match else 1
+                    
                     if sku:
-                        print(f"   Label {i+1}: SKU = {sku}")
+                        print(f"   Label {i+1}: SKU = {sku}, Qty = {qty}")
                     else:
-                        print(f"   Label {i+1}: No SKU found")
+                        print(f"   Label {i+1}: No SKU found, Qty = {qty}")
                     
                     labels.append({
                         'page': pypdf_page,
                         'page_num': i + 1,
                         'sku': sku,
+                        'qty': qty,
                         'text': text  # Store text here for summary page
                     })
         except Exception as e:
@@ -584,10 +593,13 @@ def organize_pdfs():
             
             # Add matched groups first
             for checklist, matching_labels in matched_groups:
+                # Calculate total expected from checklist
                 total_expected = sum(checklist['sku_quantities'].values())
-                total_actual = len(matching_labels)
                 
-                print(f"   Checklist page {checklist['page_num']}: Expected {total_expected}, Found {total_actual}")
+                # Calculate total actual by SUMMING label quantities (not counting pages!)
+                total_actual = sum(label.get('qty', 1) for label in matching_labels)
+                
+                print(f"   Checklist page {checklist['page_num']}: Expected {total_expected}, Found {total_actual} (from {len(matching_labels)} label pages)")
                 
                 checklist_page = checklist['page']
                 mediabox = checklist_page.mediabox
