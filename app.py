@@ -539,7 +539,8 @@ def organize_pdfs():
             # Track which labels we've already added to THIS checklist
             added_to_this_checklist = set()
             
-            for sku in checklist['skus']:
+            # Use set() to avoid processing duplicate SKUs in same checklist
+            for sku in set(checklist['skus']):
                 # Direct match
                 if sku in labels_by_sku:
                     count = len(labels_by_sku[sku])
