@@ -501,17 +501,23 @@ def organize_pdfs():
                     qty_match = re.search(qty_pattern, text, re.IGNORECASE)
                     qty = int(qty_match.group(1)) if qty_match else 1
                     
+                    # Extract order number (unique identifier)
+                    order_pattern = r'Order\s*#?:\s*([\d-]+)'
+                    order_match = re.search(order_pattern, text, re.IGNORECASE)
+                    order_num = order_match.group(1) if order_match else f"UNKNOWN-{i+1}"
+                    
                     if sku:
-                        print(f"   Label {i+1}: SKU = {sku}, Qty = {qty}")
+                        print(f"   Label {i+1}: Order #{order_num}, SKU = {sku}, Qty = {qty}")
                     else:
-                        print(f"   Label {i+1}: No SKU found, Qty = {qty}")
+                        print(f"   Label {i+1}: Order #{order_num}, No SKU found, Qty = {qty}")
                     
                     labels.append({
                         'page': pypdf_page,
                         'page_num': i + 1,
                         'sku': sku,
                         'qty': qty,
-                        'text': text  # Store text here for summary page
+                        'order_num': order_num,  # Add order number
+                        'text': text
                     })
         except Exception as e:
             error_msg = f"Error extracting text from labels: {str(e)}"
@@ -530,14 +536,13 @@ def organize_pdfs():
         
         print(f"   Labels grouped by {len(labels_by_sku)} unique SKUs")
         
-        # Track which labels were matched GLOBALLY (for unmatched detection)
-        matched_label_pages = set()
+        # Track which LABEL PAGES have been used (prevents duplicates!)
+        # Page number is the only truly unique identifier
+        used_label_pages = set()
         matched_groups = []
         
         for checklist in checklists:
             matching_labels = []
-            # Track which labels we've already added to THIS checklist
-            added_to_this_checklist = set()
             
             # Use set() to avoid processing duplicate SKUs in same checklist
             for sku in set(checklist['skus']):
@@ -546,11 +551,10 @@ def organize_pdfs():
                     count = len(labels_by_sku[sku])
                     print(f"   ✓ {sku}: Found {count} matching label(s)")
                     for label in labels_by_sku[sku]:
-                        # Only add if not already added to this checklist
-                        if label['page_num'] not in added_to_this_checklist:
+                        # Only add if this label page hasn't been used yet
+                        if label['page_num'] not in used_label_pages:
                             matching_labels.append(label)
-                            matched_label_pages.add(label['page_num'])
-                            added_to_this_checklist.add(label['page_num'])
+                            used_label_pages.add(label['page_num'])
                 # Check CSV mapping
                 elif sku_mapping and sku in sku_mapping:
                     mapped_sku = sku_mapping[sku]
@@ -558,11 +562,10 @@ def organize_pdfs():
                         count = len(labels_by_sku[mapped_sku])
                         print(f"   ✓ {sku} → {mapped_sku}: Found {count} matching label(s) via mapping")
                         for label in labels_by_sku[mapped_sku]:
-                            # Only add if not already added to this checklist
-                            if label['page_num'] not in added_to_this_checklist:
+                            # Only add if this label page hasn't been used yet
+                            if label['page_num'] not in used_label_pages:
                                 matching_labels.append(label)
-                                matched_label_pages.add(label['page_num'])
-                                added_to_this_checklist.add(label['page_num'])
+                                used_label_pages.add(label['page_num'])
                     else:
                         print(f"   ✗ {sku} → {mapped_sku}: No matching labels found")
                 else:
@@ -570,8 +573,8 @@ def organize_pdfs():
             
             matched_groups.append((checklist, matching_labels))
         
-        # Find unmatched labels
-        unmatched_labels = [label for label in labels if label['page_num'] not in matched_label_pages]
+        # Find unmatched labels (by page number)
+        unmatched_labels = [label for label in labels if label['page_num'] not in used_label_pages]
         
         print(f"\n✓ Matched {len(matched_groups)} order(s)")
         print(f"⚠️  Found {len(unmatched_labels)} unmatched label(s)")
