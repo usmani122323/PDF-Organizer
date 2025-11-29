@@ -496,10 +496,15 @@ def organize_pdfs():
                     skus = extract_skus_from_text(text)
                     sku = skus[0] if skus else None
                     
-                    # Extract quantity from label
-                    qty_pattern = r'Qty[:\s]+(\d+)'
-                    qty_match = re.search(qty_pattern, text, re.IGNORECASE)
-                    qty = int(qty_match.group(1)) if qty_match else 1
+                    # Extract quantity from label (table format: SKU followed by Qty number)
+                    qty = 1  # Default
+                    if sku:
+                        # Pattern: Find the number that appears after the SKU
+                        # e.g., "R9-05IN-HD7U 2" where 2 is the quantity
+                        qty_pattern = rf'{re.escape(sku)}\s+(\d+)'
+                        qty_match = re.search(qty_pattern, text)
+                        if qty_match:
+                            qty = int(qty_match.group(1))
                     
                     # Extract order number (unique identifier)
                     order_pattern = r'Order\s*#?:\s*([\d-]+)'
