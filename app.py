@@ -434,14 +434,11 @@ def organize_pdfs():
             with pdfplumber.open(checklist_file) as pdf:
                 for i, (pypdf_page, plumber_page) in enumerate(zip(checklist_reader.pages, pdf.pages)):
                     text = plumber_page.extract_text()
-                    print(f"\n   Page {i+1}:")
-                    print(f"   - Extracted {len(text)} characters")
                     
                     skus = extract_skus_from_text(text)
-                    print(f"   - Found SKUs: {skus}")
                     
                     if not skus:
-                        print(f"   ⚠️  No SKUs found on page {i+1}")
+                        print(f"   ⚠️  Page {i+1}: No SKUs found")
                         continue
                     
                     sku_quantities = {}
@@ -451,10 +448,10 @@ def organize_pdfs():
                         if qty_match:
                             qty = int(qty_match.group(1))
                             sku_quantities[sku] = qty
-                            print(f"   - {sku}: Expected qty = {qty}")
                         else:
                             sku_quantities[sku] = 0
-                            print(f"   - {sku}: No quantity found, assuming 0")
+                    
+                    print(f"   Page {i+1}: {len(skus)} SKU(s), Total qty: {sum(sku_quantities.values())}")
                     
                     checklists.append({
                         'page': pypdf_page,
@@ -490,6 +487,8 @@ def organize_pdfs():
         
         try:
             with pdfplumber.open(labels_file) as pdf:
+                total_labels = len(labels_reader.pages)
+                # Process in chunks to save memory
                 for i, (pypdf_page, plumber_page) in enumerate(zip(labels_reader.pages, pdf.pages)):
                     text = plumber_page.extract_text()
                     
@@ -511,18 +510,20 @@ def organize_pdfs():
                     order_match = re.search(order_pattern, text, re.IGNORECASE)
                     order_num = order_match.group(1) if order_match else f"UNKNOWN-{i+1}"
                     
-                    if sku:
-                        print(f"   Label {i+1}: Order #{order_num}, SKU = {sku}, Qty = {qty}")
-                    else:
-                        print(f"   Label {i+1}: Order #{order_num}, No SKU found, Qty = {qty}")
+                    # Only print every 50 labels to reduce output
+                    if i % 50 == 0 or i == total_labels - 1:
+                        print(f"   Processing labels... {i+1}/{total_labels}")
+                    
+                    # Store minimal text for summary (first 500 chars only to save memory)
+                    text_snippet = text[:500] if text else ""
                     
                     labels.append({
                         'page': pypdf_page,
                         'page_num': i + 1,
                         'sku': sku,
                         'qty': qty,
-                        'order_num': order_num,  # Add order number
-                        'text': text
+                        'order_num': order_num,
+                        'text': text_snippet  # Store only snippet to save memory
                     })
         except Exception as e:
             error_msg = f"Error extracting text from labels: {str(e)}"
