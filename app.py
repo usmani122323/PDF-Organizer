@@ -55,28 +55,32 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
         # Determine status and color
         if difference == 0:
             status_color = colors.HexColor('#28a745')  # Green
+            status_fill = colors.HexColor('#d4edda')   # Light green fill
             status_icon = "✓"
             status_word = "COMPLETE"
         elif difference > 0:
             status_color = colors.HexColor('#FF9800')  # Orange
+            status_fill = colors.HexColor('#fff3cd')   # Light orange fill
             status_icon = "⚠"
             status_word = "EXTRA"
         else:
             status_color = colors.HexColor('#dc3545')  # Red
+            status_fill = colors.HexColor('#f8d7da')   # Light red fill
             status_icon = "✗"
             status_word = "MISSING"
         
-        # Position: Top right corner
-        stamp_x = width - 120
-        stamp_y = height - 100
+        # Position: Top LEFT corner, below header area to avoid barcode
+        stamp_x = 80  # Left side instead of right
+        stamp_y = height - 180  # Lower to avoid barcode
         stamp_radius = 45
         
-        # Draw outer circle (stamp outline)
+        # Draw filled circle (light color background)
+        c.setFillColor(status_fill)
         c.setStrokeColor(status_color)
         c.setLineWidth(3)
-        c.circle(stamp_x, stamp_y, stamp_radius, fill=False, stroke=True)
+        c.circle(stamp_x, stamp_y, stamp_radius, fill=True, stroke=True)
         
-        # Draw inner circle (smaller, for stamp effect)
+        # Draw inner circle outline (for stamp effect)
         c.setLineWidth(2)
         c.circle(stamp_x, stamp_y, stamp_radius - 5, fill=False, stroke=True)
         
