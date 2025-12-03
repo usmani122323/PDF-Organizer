@@ -44,7 +44,7 @@ def extract_skus_from_text(text):
     return unique_skus
 
 def create_status_overlay(expected_qty, actual_qty, width, height):
-    """Create a thin colored border overlay for checklist - saves ink!"""
+    """Create a stamp-style status indicator - minimal ink usage!"""
     try:
         buffer = io.BytesIO()
         c = canvas.Canvas(buffer, pagesize=(width, height))
@@ -56,36 +56,44 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
         if difference == 0:
             status_color = colors.HexColor('#28a745')  # Green
             status_icon = "✓"
+            status_word = "COMPLETE"
         elif difference > 0:
             status_color = colors.HexColor('#FF9800')  # Orange
             status_icon = "⚠"
+            status_word = "EXTRA"
         else:
             status_color = colors.HexColor('#dc3545')  # Red
             status_icon = "✗"
+            status_word = "MISSING"
         
-        # Draw THIN border around the entire page (10pt thick)
-        border_width = 10
+        # Position: Top right corner
+        stamp_x = width - 120
+        stamp_y = height - 100
+        stamp_radius = 45
+        
+        # Draw outer circle (stamp outline)
         c.setStrokeColor(status_color)
-        c.setLineWidth(border_width)
-        c.rect(border_width/2, border_width/2, 
-               width - border_width, height - border_width, 
-               fill=False, stroke=True)
+        c.setLineWidth(3)
+        c.circle(stamp_x, stamp_y, stamp_radius, fill=False, stroke=True)
         
-        # Add small status label in top-right corner
-        label_width = 120
-        label_height = 30
-        label_x = width - label_width - 20
-        label_y = height - label_height - 20
+        # Draw inner circle (smaller, for stamp effect)
+        c.setLineWidth(2)
+        c.circle(stamp_x, stamp_y, stamp_radius - 5, fill=False, stroke=True)
         
-        # Small colored box with status
+        # Add text inside stamp
         c.setFillColor(status_color)
-        c.roundRect(label_x, label_y, label_width, label_height, 5, fill=True, stroke=False)
         
-        # Status text
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 11)
-        text = f"{status_icon} {actual_qty}/{expected_qty}"
-        c.drawCentredString(label_x + label_width/2, label_y + 10, text)
+        # Top text: Status word
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(stamp_x, stamp_y + 18, status_word)
+        
+        # Middle text: Quantity with icon
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(stamp_x, stamp_y, f"{status_icon} {actual_qty}/{expected_qty}")
+        
+        # Bottom text: "LABELS"
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(stamp_x, stamp_y - 18, "LABELS")
         
         c.save()
         buffer.seek(0)
