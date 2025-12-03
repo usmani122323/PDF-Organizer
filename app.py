@@ -69,9 +69,9 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
             status_icon = "✗"
             status_word = "MISSING"
         
-        # Position: Right side, below supplier info (in the empty space)
+        # Position: Right side, in the empty space (red box area)
         stamp_x = width - 100  # Right side
-        stamp_y = height - 250  # Lower - below supplier info area
+        stamp_y = height - 210  # Higher - in the empty box area
         stamp_radius = 45
         
         # Draw filled circle (light color background)
