@@ -44,7 +44,7 @@ def extract_skus_from_text(text):
     return unique_skus
 
 def create_status_overlay(expected_qty, actual_qty, width, height):
-    """Create a status banner overlay for checklist"""
+    """Create a thin colored border overlay for checklist - saves ink!"""
     try:
         buffer = io.BytesIO()
         c = canvas.Canvas(buffer, pagesize=(width, height))
@@ -54,37 +54,38 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
         
         # Determine status and color
         if difference == 0:
-            status_text = f"✓ {actual_qty}/{expected_qty} Labels - Perfect Match"
-            status_color = colors.green
-            note = ""
+            status_color = colors.HexColor('#28a745')  # Green
+            status_icon = "✓"
         elif difference > 0:
-            status_text = f"⚠ {actual_qty}/{expected_qty} Labels - {difference} EXTRA"
-            status_color = colors.orange
-            note = f"Note: {difference} extra label(s) included - verify before shipping"
+            status_color = colors.HexColor('#FF9800')  # Orange
+            status_icon = "⚠"
         else:
-            status_text = f"✗ {actual_qty}/{expected_qty} Labels - {abs(difference)} MISSING"
-            status_color = colors.red
-            note = f"WARNING: Missing {abs(difference)} label(s) - DO NOT SHIP until printed"
+            status_color = colors.HexColor('#dc3545')  # Red
+            status_icon = "✗"
         
-        # Draw status box below header/barcode area
-        note_height = 60
-        box_y = height - 150 - note_height
-        
-        c.setFillColor(status_color)
+        # Draw THIN border around the entire page (10pt thick)
+        border_width = 10
         c.setStrokeColor(status_color)
-        c.rect(0, box_y, width, note_height, fill=True, stroke=True)
+        c.setLineWidth(border_width)
+        c.rect(border_width/2, border_width/2, 
+               width - border_width, height - border_width, 
+               fill=False, stroke=True)
         
-        # Add text
+        # Add small status label in top-right corner
+        label_width = 120
+        label_height = 30
+        label_x = width - label_width - 20
+        label_y = height - label_height - 20
+        
+        # Small colored box with status
+        c.setFillColor(status_color)
+        c.roundRect(label_x, label_y, label_width, label_height, 5, fill=True, stroke=False)
+        
+        # Status text
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, box_y + 35, "SHIPPING LABELS STATUS:")
-        
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(40, box_y + 15, status_text)
-        
-        if note:
-            c.setFont("Helvetica", 10)
-            c.drawString(40, box_y + 3, note)
+        c.setFont("Helvetica-Bold", 11)
+        text = f"{status_icon} {actual_qty}/{expected_qty}"
+        c.drawCentredString(label_x + label_width/2, label_y + 10, text)
         
         c.save()
         buffer.seek(0)
@@ -552,26 +553,55 @@ def organize_pdfs():
             
             # Use set() to avoid processing duplicate SKUs in same checklist
             for sku in set(checklist['skus']):
+                # Get how many of this SKU the checklist needs
+                qty_needed = checklist['sku_quantities'].get(sku, 0)
+                
                 # Direct match
                 if sku in labels_by_sku:
-                    count = len(labels_by_sku[sku])
-                    print(f"   ✓ {sku}: Found {count} matching label(s)")
-                    for label in labels_by_sku[sku]:
-                        # Only add if this label page hasn't been used yet
-                        if label['page_num'] not in used_label_pages:
-                            matching_labels.append(label)
-                            used_label_pages.add(label['page_num'])
+                    available_labels = [l for l in labels_by_sku[sku] if l['page_num'] not in used_label_pages]
+                    
+                    # Calculate how many labels we need for this SKU
+                    # Sum up quantities from labels until we reach qty_needed
+                    labels_to_add = []
+                    qty_collected = 0
+                    
+                    for label in available_labels:
+                        if qty_collected >= qty_needed:
+                            break  # We have enough
+                        labels_to_add.append(label)
+                        used_label_pages.add(label['page_num'])
+                        qty_collected += label.get('qty', 1)
+                    
+                    matching_labels.extend(labels_to_add)
+                    
+                    if labels_to_add:
+                        print(f"   ✓ {sku}: Assigned {len(labels_to_add)} label(s) (qty: {qty_collected}/{qty_needed})")
+                    else:
+                        print(f"   ✗ {sku}: No available labels (all used by previous checklists)")
+                        
                 # Check CSV mapping
                 elif sku_mapping and sku in sku_mapping:
                     mapped_sku = sku_mapping[sku]
                     if mapped_sku in labels_by_sku:
-                        count = len(labels_by_sku[mapped_sku])
-                        print(f"   ✓ {sku} → {mapped_sku}: Found {count} matching label(s) via mapping")
-                        for label in labels_by_sku[mapped_sku]:
-                            # Only add if this label page hasn't been used yet
-                            if label['page_num'] not in used_label_pages:
-                                matching_labels.append(label)
-                                used_label_pages.add(label['page_num'])
+                        available_labels = [l for l in labels_by_sku[mapped_sku] if l['page_num'] not in used_label_pages]
+                        
+                        # Calculate how many labels we need for this SKU
+                        labels_to_add = []
+                        qty_collected = 0
+                        
+                        for label in available_labels:
+                            if qty_collected >= qty_needed:
+                                break
+                            labels_to_add.append(label)
+                            used_label_pages.add(label['page_num'])
+                            qty_collected += label.get('qty', 1)
+                        
+                        matching_labels.extend(labels_to_add)
+                        
+                        if labels_to_add:
+                            print(f"   ✓ {sku} → {mapped_sku}: Assigned {len(labels_to_add)} label(s) (qty: {qty_collected}/{qty_needed})")
+                        else:
+                            print(f"   ✗ {sku} → {mapped_sku}: No available labels")
                     else:
                         print(f"   ✗ {sku} → {mapped_sku}: No matching labels found")
                 else:
