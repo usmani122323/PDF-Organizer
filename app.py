@@ -20,18 +20,21 @@ def extract_skus_from_text(text):
     """Extract SKUs from text using multiple patterns"""
     skus = []
     
-    # Pattern 1: N5-96TU-TT9Z style (Letter+Digit or 2 Letters/Digits - 4 chars - 4 chars)
-    # Matches: N5-96TU-TT9Z, U2-5YVZ-Q8TC, S4-6D0J-DNSB, L4-KTDG-ZIY6, etc.
+    # Pattern 1: 2-4-4 format (N5-96TU-TT9Z, U2-5YVZ-Q8TC, etc.)
     pattern1 = re.findall(r'\b[A-Z0-9]{2}-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
     skus.extend(pattern1)
     
-    # Pattern 2: B0090IFLG6 style (Amazon ASIN)
+    # Pattern 2: Amazon ASIN (B0090IFLG6 style)
     pattern2 = re.findall(r'\bB[A-Z0-9]{9,10}\b', text)
     skus.extend(pattern2)
     
-    # Pattern 3: Longer format like N7-KJ7T-EVIN (catches variations)
+    # Pattern 3: Letter+Digit variation (N7-KJ7T-EVIN style)
     pattern3 = re.findall(r'\b[A-Z][0-9]-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
     skus.extend(pattern3)
+    
+    # Pattern 4: 4-4-4 format (1C96-8DIQ-TPS4, etc.) - NEW!
+    pattern4 = re.findall(r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
+    skus.extend(pattern4)
     
     # Remove duplicates while preserving order
     seen = set()
@@ -69,10 +72,10 @@ def create_status_overlay(expected_qty, actual_qty, width, height):
             status_icon = "✗"
             status_word = "MISSING"
         
-        # Position: Right side, higher up in the empty space
+        # Position: Right side, in the empty box area above Item Verification
         stamp_x = width - 100  # Right side
-        stamp_y = height - 175  # Much higher - between supplier info and table
-        stamp_radius = 45
+        stamp_y = height - 155  # Higher - centered in the empty space
+        stamp_radius = 40  # Slightly smaller to fit better
         
         # Draw filled circle (light color background)
         c.setFillColor(status_fill)
