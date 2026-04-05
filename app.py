@@ -1,729 +1,233 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
-from flask_cors import CORS
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-import pdfplumber
-import io
+#!/usr/bin/env python3
+import base64
+import json
 import os
-import re
-from datetime import datetime
-import tempfile
-from collections import defaultdict
-import traceback
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+from urllib.parse import quote
 
-app = Flask(__name__, static_folder='.')
-CORS(app)
+import requests
+from flask import Flask, jsonify, request
 
-def extract_skus_from_text(text):
-    """Extract SKUs from text using multiple patterns"""
-    skus = []
-    
-    # Pattern 1: 2-4-4 format (N5-96TU-TT9Z, U2-5YVZ-Q8TC, etc.)
-    pattern1 = re.findall(r'\b[A-Z0-9]{2}-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
-    skus.extend(pattern1)
-    
-    # Pattern 2: Amazon ASIN (B0090IFLG6 style)
-    pattern2 = re.findall(r'\bB[A-Z0-9]{9,10}\b', text)
-    skus.extend(pattern2)
-    
-    # Pattern 3: Letter+Digit variation (N7-KJ7T-EVIN style)
-    pattern3 = re.findall(r'\b[A-Z][0-9]-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
-    skus.extend(pattern3)
-    
-    # Pattern 4: 4-4-4 format (1C96-8DIQ-TPS4, etc.) - NEW!
-    pattern4 = re.findall(r'\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b', text)
-    skus.extend(pattern4)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_skus = []
-    for sku in skus:
-        if sku not in seen:
-            seen.add(sku)
-            unique_skus.append(sku)
-    
-    return unique_skus
+app = Flask(__name__)
 
-def create_status_overlay(expected_qty, actual_qty, width, height):
-    """Create a stamp-style status indicator - minimal ink usage!"""
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+PDF_ORGANIZER_BUCKET = os.environ.get("PDF_ORGANIZER_BUCKET", "supplier-return-labels")
+PROCESSOR_URL = os.environ.get("PDF_ORGANIZER_PROCESSOR_URL", "").strip()
+PROCESSOR_SECRET = os.environ.get("PDF_ORGANIZER_PROCESSOR_SECRET", "").strip()
+WORKER_SECRET = os.environ.get("PDF_ORGANIZER_WORKER_SECRET", "").strip()
+HEARTBEAT_SECONDS = int(os.environ.get("PDF_ORGANIZER_WORKER_HEARTBEAT_SECONDS", "20"))
+MAX_ATTEMPTS = int(os.environ.get("PDF_ORGANIZER_MAX_ATTEMPTS", "3"))
+BASE_BACKOFF_SECONDS = int(os.environ.get("PDF_ORGANIZER_BASE_BACKOFF_SECONDS", "30"))
+PROCESSOR_TIMEOUT_SECONDS = int(os.environ.get("PDF_ORGANIZER_PROCESSOR_TIMEOUT_SECONDS", "900"))
+PROCESSOR_ATTEMPTS = max(1, int(os.environ.get("PDF_ORGANIZER_PROCESSOR_ATTEMPTS", "3")))
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def supabase_headers() -> Dict[str, str]:
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+
+def ensure_env() -> Optional[str]:
+    if not SUPABASE_URL:
+        return "SUPABASE_URL is missing"
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return "SUPABASE_SERVICE_ROLE_KEY is missing"
+    if not PROCESSOR_URL:
+        return "PDF_ORGANIZER_PROCESSOR_URL is missing"
+    return None
+
+
+def update_job(job_id: str, payload: Dict[str, Any]) -> None:
+    url = f"{SUPABASE_URL}/rest/v1/pdf_organizer_jobs?id=eq.{quote(job_id, safe='')}"
+    headers = supabase_headers()
+    headers["Content-Type"] = "application/json"
+    headers["Prefer"] = "return=minimal"
+    r = requests.patch(url, headers=headers, data=json.dumps(payload), timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"update_job failed {r.status_code}: {r.text[:500]}")
+
+
+def mark_retry(job_id: str, msg: str, code: str) -> None:
+    url = f"{SUPABASE_URL}/rest/v1/rpc/mark_pdf_organizer_job_retry"
+    headers = supabase_headers()
+    headers["Content-Type"] = "application/json"
+    payload = {
+        "p_job_id": job_id,
+        "p_error_message": msg,
+        "p_error_code": code,
+        "p_max_attempts": MAX_ATTEMPTS,
+        "p_base_backoff_seconds": BASE_BACKOFF_SECONDS,
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"mark_retry failed {r.status_code}: {r.text[:500]}")
+
+
+def upload_pdf(path: str, content: bytes) -> None:
+    safe_path = quote(path, safe="/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{PDF_ORGANIZER_BUCKET}/{safe_path}"
+    headers = supabase_headers()
+    headers["Content-Type"] = "application/pdf"
+    headers["x-upsert"] = "true"
+    r = requests.post(url, headers=headers, data=content, timeout=120)
+    if r.status_code >= 300:
+        raise RuntimeError(f"upload_pdf failed {r.status_code}: {r.text[:500]}")
+
+
+def heartbeat_loop(job_id: str, worker_id: str, stop_event: threading.Event) -> None:
+    while not stop_event.wait(HEARTBEAT_SECONDS):
+        try:
+            update_job(job_id, {
+                "status": "processing",
+                "worker_id": worker_id,
+                "last_heartbeat_at": utc_now_iso(),
+            })
+        except Exception as e:
+            print(f"[heartbeat] {job_id} {e}")
+
+
+def call_processor(checklist_paths: list[str], labels_paths: list[str], csv_data: Optional[str]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"checklistPaths": checklist_paths, "labelsPaths": labels_paths}
+    if csv_data and csv_data.strip():
+        payload["csvData"] = csv_data
+
+    headers = {"Content-Type": "application/json"}
+    if PROCESSOR_SECRET:
+        headers["Authorization"] = f"Bearer {PROCESSOR_SECRET}"
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, PROCESSOR_ATTEMPTS + 1):
+        try:
+            r = requests.post(PROCESSOR_URL, headers=headers, data=json.dumps(payload), timeout=PROCESSOR_TIMEOUT_SECONDS)
+            if r.status_code >= 500 and attempt < PROCESSOR_ATTEMPTS:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            if r.status_code >= 300:
+                raise RuntimeError(f"processor HTTP {r.status_code}: {r.text[:800]}")
+            data = r.json()
+            if not isinstance(data.get("labelsPdf"), str) or not isinstance(data.get("checklistPdf"), str):
+                raise RuntimeError("processor missing labelsPdf/checklistPdf")
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt < PROCESSOR_ATTEMPTS:
+                time.sleep(min(2 ** attempt, 8))
+    raise RuntimeError(f"processor failed after {PROCESSOR_ATTEMPTS} attempts: {last_err}")
+
+
+def process_job(body: Dict[str, Any]) -> None:
+    job_id = str(body["jobId"])
+    checklist_paths = [x for x in body.get("checklistPaths", []) if isinstance(x, str) and x]
+    labels_paths = [x for x in body.get("labelsPaths", []) if isinstance(x, str) and x]
+    csv_data = body.get("csvData") if isinstance(body.get("csvData"), str) else None
+    worker_id = str(body.get("workerId") or f"render-worker-{os.getpid()}")
+
+    stop_event = threading.Event()
+    t = threading.Thread(target=heartbeat_loop, args=(job_id, worker_id, stop_event), daemon=True)
+
     try:
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=(width, height))
-        
-        # Calculate difference
-        difference = actual_qty - expected_qty
-        
-        # Determine status and color
-        if difference == 0:
-            status_color = colors.HexColor('#28a745')  # Green
-            status_fill = colors.HexColor('#d4edda')   # Light green fill
-            status_icon = "✓"
-            status_word = "COMPLETE"
-        elif difference > 0:
-            status_color = colors.HexColor('#FF9800')  # Orange
-            status_fill = colors.HexColor('#fff3cd')   # Light orange fill
-            status_icon = "⚠"
-            status_word = "EXTRA"
-        else:
-            status_color = colors.HexColor('#dc3545')  # Red
-            status_fill = colors.HexColor('#f8d7da')   # Light red fill
-            status_icon = "✗"
-            status_word = "MISSING"
-        
-        # Position: Right side, in the empty box area above Item Verification
-        stamp_x = width - 100  # Right side
-        stamp_y = height - 155  # Higher - centered in the empty space
-        stamp_radius = 40  # Slightly smaller to fit better
-        
-        # Draw filled circle (light color background)
-        c.setFillColor(status_fill)
-        c.setStrokeColor(status_color)
-        c.setLineWidth(3)
-        c.circle(stamp_x, stamp_y, stamp_radius, fill=True, stroke=True)
-        
-        # Draw inner circle outline (for stamp effect)
-        c.setLineWidth(2)
-        c.circle(stamp_x, stamp_y, stamp_radius - 5, fill=False, stroke=True)
-        
-        # Add text inside stamp
-        c.setFillColor(status_color)
-        
-        # Top text: Status word
-        c.setFont("Helvetica-Bold", 9)
-        c.drawCentredString(stamp_x, stamp_y + 18, status_word)
-        
-        # Middle text: Quantity with icon
-        c.setFont("Helvetica-Bold", 14)
-        c.drawCentredString(stamp_x, stamp_y, f"{status_icon} {actual_qty}/{expected_qty}")
-        
-        # Bottom text: "LABELS"
-        c.setFont("Helvetica-Bold", 9)
-        c.drawCentredString(stamp_x, stamp_y - 18, "LABELS")
-        
-        c.save()
-        buffer.seek(0)
-        return buffer
+        update_job(job_id, {
+            "status": "processing",
+            "started_at": utc_now_iso(),
+            "completed_at": None,
+            "error_message": None,
+            "last_error_code": None,
+            "worker_id": worker_id,
+            "last_heartbeat_at": utc_now_iso(),
+            "retry_after": None,
+        })
+        t.start()
+
+        if not checklist_paths or not labels_paths:
+            raise RuntimeError("missing checklistPaths or labelsPaths")
+
+        result = call_processor(checklist_paths, labels_paths, csv_data)
+        labels_pdf = base64.b64decode(result["labelsPdf"])
+        checklist_pdf = base64.b64decode(result["checklistPdf"])
+
+        labels_path = f"pdf-organizer-output/{job_id}/labels.pdf"
+        checklist_path = f"pdf-organizer-output/{job_id}/checklists.pdf"
+
+        upload_pdf(labels_path, labels_pdf)
+        upload_pdf(checklist_path, checklist_pdf)
+
+        update_job(job_id, {
+            "status": "done",
+            "completed_at": utc_now_iso(),
+            "worker_id": None,
+            "last_heartbeat_at": utc_now_iso(),
+            "error_message": None,
+            "last_error_code": None,
+            "retry_after": None,
+            "output_paths": {"labelsPath": labels_path, "checklistPath": checklist_path},
+            "stats": result.get("stats") if isinstance(result.get("stats"), dict) else None,
+        })
+        print(f"[worker] done {job_id}")
+
     except Exception as e:
-        print(f"❌ Error creating status overlay: {str(e)}")
-        raise
+        msg = str(e)
+        print(f"[worker] failed {job_id}: {msg}")
+        try:
+            mark_retry(job_id, msg, "worker_processing_error")
+        except Exception as e2:
+            update_job(job_id, {
+                "status": "failed",
+                "completed_at": utc_now_iso(),
+                "error_message": f"{msg} | mark_retry_failed: {e2}",
+                "last_error_code": "worker_retry_mark_failed",
+                "worker_id": None,
+            })
+    finally:
+        stop_event.set()
 
-def create_summary_page(matched_groups, unmatched_labels, total_labels, start_time, width=612, height=792):
-    """Create a comprehensive summary page"""
-    import time
-    processing_time = time.time() - start_time
-    
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=(width, height))
-    
-    # Background
-    c.setFillColor(colors.white)
-    c.rect(0, 0, width, height, fill=True, stroke=False)
-    
-    # Header section
-    c.setFillColor(colors.HexColor('#667eea'))
-    c.rect(0, height - 120, width, 120, fill=True, stroke=False)
-    
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 28)
-    c.drawCentredString(width / 2, height - 50, "📦 USMANI WHOLESALE")
-    c.setFont("Helvetica-Bold", 18)
-    c.drawCentredString(width / 2, height - 75, "DAILY SHIPPING SUMMARY REPORT")
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(width / 2, height - 95, datetime.now().strftime("%B %d, %Y - %I:%M %p"))
-    
-    y = height - 150
-    
-    # Processing Summary Box
-    c.setFillColor(colors.HexColor('#F0F4FF'))
-    c.setStrokeColor(colors.HexColor('#667eea'))
-    c.setLineWidth(2)
-    c.rect(40, y - 80, width - 80, 75, fill=True, stroke=True)
-    
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(60, y - 25, "📊 PROCESSING SUMMARY")
-    c.setFont("Helvetica", 11)
-    c.drawString(80, y - 45, f"• Total Checklists: {len(matched_groups)}")
-    c.drawString(80, y - 60, f"• Total Labels: {total_labels}")
-    c.drawString(80, y - 75, f"• Processing Time: {processing_time:.1f} seconds")
-    
-    y -= 110
-    
-    # Matched Orders Section
-    c.setFillColor(colors.HexColor('#28a745'))
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, y, f"✅ MATCHED ORDERS: {len(matched_groups)}")
-    
-    y -= 25
-    c.setFont("Helvetica", 10)
-    
-    page_num = 2  # Summary is page 1, content starts at page 2
-    
-    for i, (checklist, labels) in enumerate(matched_groups, 1):
-        if y < 200:  # If running out of space
-            break
-            
-        expected = sum(checklist['sku_quantities'].values())
-        # Sum quantities instead of counting pages
-        actual = sum(label.get('qty', 1) for label in labels)
-        diff = actual - expected
-        
-        # Extract PO number from checklist text
-        po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
-        po_num = po_match.group(1) if po_match else "Unknown"
-        
-        # Extract supplier
-        supplier_match = re.search(r'Supplier:\s*([^\n]+)', checklist['text'])
-        supplier = supplier_match.group(1).strip() if supplier_match else "Unknown"
-        
-        # Status color and text
-        if diff == 0:
-            status_color = colors.HexColor('#28a745')
-            status_text = f"✓ {actual}/{expected} Labels - Perfect Match"
-        elif diff > 0:
-            status_color = colors.HexColor('#FF9800')
-            status_text = f"⚠ {actual}/{expected} Labels - {diff} EXTRA"
-        else:
-            status_color = colors.HexColor('#dc3545')
-            status_text = f"✗ {actual}/{expected} Labels - {abs(diff)} MISSING"
-        
-        # Draw order info
-        c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(60, y, f"{i}. PO-{po_num} ({supplier})")
-        
-        c.setFont("Helvetica", 9)
-        c.setFillColor(colors.HexColor('#666666'))
-        skus = ", ".join(checklist['skus'][:2])  # Show first 2 SKUs
-        if len(checklist['skus']) > 2:
-            skus += f" +{len(checklist['skus']) - 2} more"
-        c.drawString(75, y - 12, f"SKU: {skus}")
-        
-        c.setFillColor(status_color)
-        c.drawString(75, y - 24, f"Status: {status_text}")
-        
-        c.setFillColor(colors.HexColor('#666666'))
-        end_page = page_num + len(labels)
-        c.drawString(75, y - 36, f"Pages: {page_num}-{end_page}")
-        
-        page_num = end_page + 1
-        y -= 50
-    
-    if len(matched_groups) > 4:
-        c.setFont("Helvetica", 9)
-        c.setFillColor(colors.HexColor('#666666'))
-        c.drawString(60, y, f"... and {len(matched_groups) - 4} more orders (see full PDF)")
-        y -= 20
-    
-    y -= 20
-    
-    # Unmatched Labels Section
-    if unmatched_labels:
-        c.setFillColor(colors.HexColor('#FF9800'))
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, y, f"⚠️ UNMATCHED LABELS: {len(unmatched_labels)}")
-        y -= 20
-        
-        c.setFont("Helvetica", 10)
-        c.setFillColor(colors.black)
-        for label in unmatched_labels[:3]:
-            order_match = re.search(r'Order.*?(\d{3}-\d{7}-\d{7})', label.get('text', ''))
-            order_num = order_match.group(1) if order_match else "Unknown"
-            c.drawString(60, y, f"• SKU: {label['sku'] or 'None'} (Order #{order_num})")
-            y -= 15
-        
-        if len(unmatched_labels) > 3:
-            c.setFont("Helvetica", 9)
-            c.setFillColor(colors.HexColor('#666666'))
-            c.drawString(60, y, f"... and {len(unmatched_labels) - 3} more (see end of PDF)")
-            y -= 15
-        
-        y -= 10
-    
-    # Action Items Section
-    y -= 20
-    c.setFillColor(colors.HexColor('#667eea'))
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, y, "🎯 ACTION ITEMS")
-    y -= 25
-    
-    # High priority items (missing labels)
-    missing_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                      if sum(label.get('qty', 1) for label in labels) < sum(checklist['sku_quantities'].values())]
-    
-    if missing_orders:
-        c.setFillColor(colors.HexColor('#dc3545'))
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(60, y, "⚠️ HIGH PRIORITY:")
-        y -= 15
-        c.setFont("Helvetica", 10)
-        c.setFillColor(colors.black)
-        for checklist, labels in missing_orders[:2]:
-            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
-            po_num = po_match.group(1) if po_match else "Unknown"
-            actual_qty = sum(label.get('qty', 1) for label in labels)
-            expected_qty = sum(checklist['sku_quantities'].values())
-            missing = expected_qty - actual_qty
-            c.drawString(75, y, f"• PO-{po_num}: MISSING {missing} label(s) - DO NOT SHIP")
-            y -= 15
-        y -= 10
-    
-    # Review needed items (extras or unmatched)
-    extra_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                    if sum(label.get('qty', 1) for label in labels) > sum(checklist['sku_quantities'].values())]
-    
-    if extra_orders or unmatched_labels:
-        c.setFillColor(colors.HexColor('#FF9800'))
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(60, y, "📋 REVIEW NEEDED:")
-        y -= 15
-        c.setFont("Helvetica", 10)
-        c.setFillColor(colors.black)
-        
-        for checklist, labels in extra_orders[:2]:
-            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
-            po_num = po_match.group(1) if po_match else "Unknown"
-            c.drawString(75, y, f"• PO-{po_num}: Verify extra labels before shipping")
-            y -= 15
-        
-        if unmatched_labels:
-            c.drawString(75, y, f"• {len(unmatched_labels)} unmatched labels need checklist assignment")
-            y -= 15
-        y -= 10
-    
-    # Ready to ship
-    perfect_orders = [(checklist, labels) for checklist, labels in matched_groups 
-                      if sum(label.get('qty', 1) for label in labels) == sum(checklist['sku_quantities'].values())]
-    
-    if perfect_orders:
-        c.setFillColor(colors.HexColor('#28a745'))
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(60, y, f"✅ READY TO SHIP: {len(perfect_orders)} order(s)")
-        y -= 15
-        c.setFont("Helvetica", 10)
-        c.setFillColor(colors.black)
-        for checklist, labels in perfect_orders[:3]:
-            po_match = re.search(r'PO.*?(\d{5,})', checklist['text'])
-            po_num = po_match.group(1) if po_match else "Unknown"
-            c.drawString(75, y, f"• PO-{po_num} (Perfect match)")
-            y -= 15
-    
-    # Footer
-    c.setFillColor(colors.HexColor('#999999'))
-    c.setFont("Helvetica", 9)
-    c.drawCentredString(width / 2, 30, "Generated by PDF Organizer v2.0")
-    c.drawCentredString(width / 2, 18, "https://pdf-organizer-evoe.onrender.com")
-    
-    c.save()
-    buffer.seek(0)
-    return buffer
 
-def create_unmatched_separator_page(unmatched_count, width=612, height=792):
-    """Create a warning page for labels without checklists"""
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=(width, height))
-    
-    # Background
-    c.setFillColor(colors.HexColor('#FFF3CD'))
-    c.rect(0, 0, width, height, fill=True, stroke=False)
-    
-    # Warning banner
-    banner_height = 120
-    banner_y = (height - banner_height) / 2
-    
-    c.setFillColor(colors.HexColor('#FF9800'))
-    c.setStrokeColor(colors.HexColor('#F57C00'))
-    c.setLineWidth(3)
-    c.rect(50, banner_y, width - 100, banner_height, fill=True, stroke=True)
-    
-    # Warning icon and text
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 48)
-    c.drawCentredString(width / 2, banner_y + 70, "⚠️")
-    
-    c.setFont("Helvetica-Bold", 24)
-    c.drawCentredString(width / 2, banner_y + 45, "LABELS WITHOUT CHECKLIST")
-    
-    c.setFont("Helvetica", 16)
-    c.drawCentredString(width / 2, banner_y + 20, f"{unmatched_count} label(s) found with no matching checklist")
-    
-    # Instructions
-    c.setFillColor(colors.HexColor('#856404'))
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(width / 2, banner_y - 40, "ACTION REQUIRED:")
-    
-    c.setFont("Helvetica", 12)
-    instructions = [
-        "• Check if checklists are missing or delayed",
-        "• Verify SKUs match between checklist and labels",
-        "• Hold these shipments until checklists arrive",
-        "• Update daily order report if needed"
-    ]
-    
-    y_pos = banner_y - 70
-    for instruction in instructions:
-        c.drawString(100, y_pos, instruction)
-        y_pos -= 25
-    
-    c.save()
-    buffer.seek(0)
-    return buffer
+def auth_ok(req) -> bool:
+    if not WORKER_SECRET:
+        return True
+    return (req.headers.get("Authorization") or "").strip() == f"Bearer {WORKER_SECRET}"
 
-@app.route('/')
-def home():
-    """Serve the main HTML page"""
-    try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        index_path = os.path.join(base_dir, 'index.html')
-        
-        print(f"Looking for index.html in: {base_dir}")
-        
-        if not os.path.exists(index_path):
-            files = os.listdir(base_dir)
-            print(f"Files in directory: {files}")
-            return jsonify({
-                "error": "index.html not found", 
-                "looking_in": base_dir,
-                "files": files
-            }), 404
-        
-        print(f"✓ Found index.html at: {index_path}")
-        return send_file(index_path)
-    except Exception as e:
-        print(f"❌ Error serving homepage: {str(e)}")
-        return jsonify({"error": f"Could not load homepage: {str(e)}"}), 500
 
-@app.route('/health', methods=['GET'])
+@app.get("/worker/health")
 def health():
-    return jsonify({"status": "healthy", "message": "PDF Organizer is running"}), 200
+    err = ensure_env()
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+    return jsonify({"ok": True, "status": "healthy"}), 200
 
-@app.route('/api/organize-pdfs', methods=['POST'])
-def organize_pdfs():
+
+@app.post("/worker/process-pdf-organizer-job")
+def process_pdf_organizer_job():
+    if not auth_ok(request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    err = ensure_env()
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+
     try:
-        print("\n" + "="*50)
-        print("📋 NEW REQUEST RECEIVED")
-        print("="*50)
-        
-        checklist_file = request.files.get('checklist')
-        labels_file = request.files.get('labels')
-        csv_data = request.form.get('csv_data', '')
-        
-        if not checklist_file:
-            error_msg = "No checklist file uploaded"
-            print(f"❌ ERROR: {error_msg}")
-            return jsonify({"error": error_msg}), 400
-            
-        if not labels_file:
-            error_msg = "No labels file uploaded"
-            print(f"❌ ERROR: {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        print(f"📋 Checklist: {checklist_file.filename}")
-        print(f"🏷️  Labels: {labels_file.filename}")
-        
-        # Parse CSV mapping
-        sku_mapping = {}
-        if csv_data:
-            print(f"📊 CSV mapping provided")
-            for line in csv_data.strip().split('\n'):
-                if ',' in line:
-                    parts = line.split(',')
-                    if len(parts) >= 2:
-                        sku_mapping[parts[0].strip()] = parts[1].strip()
-            print(f"   Mapped {len(sku_mapping)} SKUs")
-        
-        # Process checklist PDF
-        print("\n🔍 STEP 1: Processing checklist...")
-        try:
-            checklist_reader = PdfReader(checklist_file)
-            print(f"   ✓ Opened checklist PDF ({len(checklist_reader.pages)} pages)")
-        except Exception as e:
-            error_msg = f"Could not read checklist PDF: {str(e)}"
-            print(f"❌ ERROR: {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        checklists = []
-        
-        try:
-            with pdfplumber.open(checklist_file) as pdf:
-                for i, (pypdf_page, plumber_page) in enumerate(zip(checklist_reader.pages, pdf.pages)):
-                    text = plumber_page.extract_text()
-                    
-                    skus = extract_skus_from_text(text)
-                    
-                    if not skus:
-                        print(f"   ⚠️  Page {i+1}: No SKUs found")
-                        continue
-                    
-                    sku_quantities = {}
-                    for sku in skus:
-                        qty_pattern = rf'{re.escape(sku)}\s+(\d+)'
-                        qty_match = re.search(qty_pattern, text)
-                        if qty_match:
-                            qty = int(qty_match.group(1))
-                            sku_quantities[sku] = qty
-                        else:
-                            sku_quantities[sku] = 0
-                    
-                    print(f"   Page {i+1}: {len(skus)} SKU(s), Total qty: {sum(sku_quantities.values())}")
-                    
-                    checklists.append({
-                        'page': pypdf_page,
-                        'page_num': i + 1,
-                        'skus': skus,
-                        'sku_quantities': sku_quantities,
-                        'text': text
-                    })
-        except Exception as e:
-            error_msg = f"Error extracting text from checklist: {str(e)}"
-            print(f"❌ ERROR: {error_msg}")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        if not checklists:
-            error_msg = "No SKUs found in checklist PDF"
-            print(f"❌ ERROR: {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        print(f"\n✓ Found {len(checklists)} checklist page(s) with SKUs")
-        
-        # Process labels PDF
-        print("\n🔍 STEP 2: Processing labels...")
-        try:
-            labels_reader = PdfReader(labels_file)
-            print(f"   ✓ Opened labels PDF ({len(labels_reader.pages)} pages)")
-        except Exception as e:
-            error_msg = f"Could not read labels PDF: {str(e)}"
-            print(f"❌ ERROR: {error_msg}")
-            return jsonify({"error": error_msg}), 400
-        
-        labels = []
-        
-        try:
-            with pdfplumber.open(labels_file) as pdf:
-                total_labels = len(labels_reader.pages)
-                # Process in chunks to save memory
-                for i, (pypdf_page, plumber_page) in enumerate(zip(labels_reader.pages, pdf.pages)):
-                    text = plumber_page.extract_text()
-                    
-                    skus = extract_skus_from_text(text)
-                    sku = skus[0] if skus else None
-                    
-                    # Extract quantity from label (table format: SKU followed by Qty number)
-                    qty = 1  # Default
-                    if sku:
-                        # Pattern: Find the number that appears after the SKU
-                        # e.g., "R9-05IN-HD7U 2" where 2 is the quantity
-                        qty_pattern = rf'{re.escape(sku)}\s+(\d+)'
-                        qty_match = re.search(qty_pattern, text)
-                        if qty_match:
-                            qty = int(qty_match.group(1))
-                    
-                    # Extract order number (unique identifier)
-                    order_pattern = r'Order\s*#?:\s*([\d-]+)'
-                    order_match = re.search(order_pattern, text, re.IGNORECASE)
-                    order_num = order_match.group(1) if order_match else f"UNKNOWN-{i+1}"
-                    
-                    # Only print every 50 labels to reduce output
-                    if i % 50 == 0 or i == total_labels - 1:
-                        print(f"   Processing labels... {i+1}/{total_labels}")
-                    
-                    # Store minimal text for summary (first 500 chars only to save memory)
-                    text_snippet = text[:500] if text else ""
-                    
-                    labels.append({
-                        'page': pypdf_page,
-                        'page_num': i + 1,
-                        'sku': sku,
-                        'qty': qty,
-                        'order_num': order_num,
-                        'text': text_snippet  # Store only snippet to save memory
-                    })
-        except Exception as e:
-            error_msg = f"Error extracting text from labels: {str(e)}"
-            print(f"❌ ERROR: {error_msg}")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-        print(f"\n✓ Found {len(labels)} label(s)")
-        
-        # Match labels to checklists
-        print("\n🔍 STEP 3: Matching labels to checklists...")
-        labels_by_sku = defaultdict(list)
-        for label in labels:
-            if label['sku']:
-                labels_by_sku[label['sku']].append(label)
-        
-        print(f"   Labels grouped by {len(labels_by_sku)} unique SKUs")
-        
-        # Track which LABEL PAGES have been used (prevents duplicates!)
-        # Page number is the only truly unique identifier
-        used_label_pages = set()
-        matched_groups = []
-        
-        for checklist in checklists:
-            matching_labels = []
-            
-            # Use set() to avoid processing duplicate SKUs in same checklist
-            for sku in set(checklist['skus']):
-                # Get how many of this SKU the checklist needs
-                qty_needed = checklist['sku_quantities'].get(sku, 0)
-                
-                # Direct match
-                if sku in labels_by_sku:
-                    available_labels = [l for l in labels_by_sku[sku] if l['page_num'] not in used_label_pages]
-                    
-                    # Calculate how many labels we need for this SKU
-                    # Sum up quantities from labels until we reach qty_needed
-                    labels_to_add = []
-                    qty_collected = 0
-                    
-                    for label in available_labels:
-                        if qty_collected >= qty_needed:
-                            break  # We have enough
-                        labels_to_add.append(label)
-                        used_label_pages.add(label['page_num'])
-                        qty_collected += label.get('qty', 1)
-                    
-                    matching_labels.extend(labels_to_add)
-                    
-                    if labels_to_add:
-                        print(f"   ✓ {sku}: Assigned {len(labels_to_add)} label(s) (qty: {qty_collected}/{qty_needed})")
-                    else:
-                        print(f"   ✗ {sku}: No available labels (all used by previous checklists)")
-                        
-                # Check CSV mapping
-                elif sku_mapping and sku in sku_mapping:
-                    mapped_sku = sku_mapping[sku]
-                    if mapped_sku in labels_by_sku:
-                        available_labels = [l for l in labels_by_sku[mapped_sku] if l['page_num'] not in used_label_pages]
-                        
-                        # Calculate how many labels we need for this SKU
-                        labels_to_add = []
-                        qty_collected = 0
-                        
-                        for label in available_labels:
-                            if qty_collected >= qty_needed:
-                                break
-                            labels_to_add.append(label)
-                            used_label_pages.add(label['page_num'])
-                            qty_collected += label.get('qty', 1)
-                        
-                        matching_labels.extend(labels_to_add)
-                        
-                        if labels_to_add:
-                            print(f"   ✓ {sku} → {mapped_sku}: Assigned {len(labels_to_add)} label(s) (qty: {qty_collected}/{qty_needed})")
-                        else:
-                            print(f"   ✗ {sku} → {mapped_sku}: No available labels")
-                    else:
-                        print(f"   ✗ {sku} → {mapped_sku}: No matching labels found")
-                else:
-                    print(f"   ✗ {sku}: No matching labels found")
-            
-            matched_groups.append((checklist, matching_labels))
-        
-        # Find unmatched labels (by page number)
-        unmatched_labels = [label for label in labels if label['page_num'] not in used_label_pages]
-        
-        print(f"\n✓ Matched {len(matched_groups)} order(s)")
-        print(f"⚠️  Found {len(unmatched_labels)} unmatched label(s)")
-        
-        # Create organized PDF
-        print("\n🔍 STEP 4: Creating organized PDF...")
-        try:
-            import time
-            start_time = time.time()
-            
-            output = io.BytesIO()
-            writer = PdfWriter()
-            
-            # Add summary page FIRST
-            print("   Creating summary page...")
-            summary_buffer = create_summary_page(matched_groups, unmatched_labels, len(labels), start_time)
-            summary_reader = PdfReader(summary_buffer)
-            writer.add_page(summary_reader.pages[0])
-            print("   ✓ Summary page added")
-            
-            # Add matched groups first
-            for checklist, matching_labels in matched_groups:
-                # Calculate total expected from checklist
-                total_expected = sum(checklist['sku_quantities'].values())
-                
-                # Calculate total actual by SUMMING label quantities (not counting pages!)
-                total_actual = sum(label.get('qty', 1) for label in matching_labels)
-                
-                print(f"   Checklist page {checklist['page_num']}: Expected {total_expected}, Found {total_actual} (from {len(matching_labels)} label pages)")
-                
-                checklist_page = checklist['page']
-                mediabox = checklist_page.mediabox
-                width = float(mediabox.width)
-                height = float(mediabox.height)
-                
-                overlay_buffer = create_status_overlay(total_expected, total_actual, width, height)
-                overlay_reader = PdfReader(overlay_buffer)
-                
-                checklist_page.merge_page(overlay_reader.pages[0])
-                writer.add_page(checklist_page)
-                
-                for label in matching_labels:
-                    writer.add_page(label['page'])
-            
-            # Add unmatched labels section if any exist
-            if unmatched_labels:
-                print(f"\n   Adding separator page for {len(unmatched_labels)} unmatched labels...")
-                separator_buffer = create_unmatched_separator_page(len(unmatched_labels))
-                separator_reader = PdfReader(separator_buffer)
-                writer.add_page(separator_reader.pages[0])
-                
-                print(f"   Adding {len(unmatched_labels)} unmatched labels...")
-                for label in unmatched_labels:
-                    writer.add_page(label['page'])
-                    print(f"   - Added label page {label['page_num']} (SKU: {label['sku'] or 'None'})")
-            
-            writer.write(output)
-            output.seek(0)
-            
-            total_pages = len(writer.pages)
-            print(f"\n✓ Created organized PDF with {total_pages} pages")
-            print(f"  - Matched sections: {len(matched_groups)}")
-            print(f"  - Unmatched labels: {len(unmatched_labels)}")
-            
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-            temp_file.write(output.read())
-            temp_file.close()
-            
-            print(f"✓ Saved to: {temp_file.name}")
-            print("="*50)
-            print("🎉 SUCCESS!")
-            print("="*50 + "\n")
-            
-            return send_file(
-                temp_file.name,
-                mimetype='application/pdf',
-                as_attachment=True,
-                download_name=f'organized_shipping_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
-            )
-            
-        except Exception as e:
-            error_msg = f"Error creating final PDF: {str(e)}"
-            print(f"❌ ERROR: {error_msg}")
-            traceback.print_exc()
-            return jsonify({"error": error_msg}), 500
-        
-    except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        print(f"❌ FATAL ERROR: {error_msg}")
-        traceback.print_exc()
-        return jsonify({"error": error_msg}), 500
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print("\n" + "="*50)
-    print("🚀 PDF ORGANIZER STARTING")
-    print("="*50)
-    print(f"Port: {port}")
-    print(f"Debug: False")
-    print("="*50 + "\n")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    if not isinstance(body.get("jobId"), str) or not body["jobId"].strip():
+        return jsonify({"ok": False, "error": "jobId is required"}), 400
+    if not isinstance(body.get("checklistPaths"), list) or not isinstance(body.get("labelsPaths"), list):
+        return jsonify({"ok": False, "error": "checklistPaths and labelsPaths must be arrays"}), 400
+
+    threading.Thread(target=process_job, args=(body,), daemon=True).start()
+    return jsonify({"ok": True, "accepted": True, "jobId": body["jobId"]}), 202
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
